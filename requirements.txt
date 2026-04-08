@@ -4,4 +4,4 @@ numpy
 soundfile
 resampy
 torch
-faster-whisper>=1.0.0
+nemo_toolkit[asr]

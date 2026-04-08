@@ -59,7 +59,7 @@ def require_api_key(f):
 def health():
     return jsonify({
         "ready": is_ready,
-        "model": "faster-whisper-large-v3"
+        "model": "nvidia/canary-180m-flash"
     })
 
 
