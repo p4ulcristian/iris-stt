@@ -3,8 +3,10 @@
 Iris STT Server - Speech-to-Text HTTP API
 
 Endpoints:
-  GET  /health      - Health check
-  POST /transcribe  - Upload audio file, get text back
+  GET    /health               - Health check
+  POST   /transcribe           - Upload audio file, get text back
+  POST   /detect-wake-word     - Stream raw float32 PCM chunk, get confidence score
+  DELETE /wake-word/session    - Explicit session teardown on disarm
 """
 
 import os
@@ -28,6 +30,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from stt import SpeechToText, SAMPLE_RATE
+from wake_word import detect as ww_detect, remove_session as ww_remove_session
 
 app = Flask(__name__)
 CORS(app)
@@ -104,6 +107,35 @@ def transcribe():
         })
     finally:
         os.unlink(temp_path)
+
+
+@app.route('/detect-wake-word', methods=['POST'])
+@require_api_key
+def detect_wake_word():
+    session_id = request.headers.get("X-Wake-Session")
+    if not session_id:
+        return jsonify({"error": "X-Wake-Session header required"}), 400
+
+    audio_bytes = request.get_data()
+
+    min_bytes = 1280 * 4  # 1280 float32 samples = 80 ms
+    if len(audio_bytes) < min_bytes:
+        return jsonify({"error": f"Audio too short (got {len(audio_bytes)} bytes, need >= {min_bytes})"}), 400
+
+    if len(audio_bytes) % 4 != 0:
+        return jsonify({"error": "Body must be raw float32 PCM (byte length must be a multiple of 4)"}), 400
+
+    result = ww_detect(session_id, audio_bytes)
+    return jsonify(result)
+
+
+@app.route('/wake-word/session', methods=['DELETE'])
+@require_api_key
+def delete_wake_session():
+    session_id = request.headers.get("X-Wake-Session")
+    if session_id:
+        ww_remove_session(session_id)
+    return jsonify({"ok": True})
 
 
 def load_model():
