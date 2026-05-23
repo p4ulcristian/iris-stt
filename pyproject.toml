@@ -14,4 +14,19 @@ dependencies = [
     "nemo_toolkit[asr]",
     "openwakeword>=0.4.0",
     "onnxruntime>=1.26.0",
+    # Chatterbox's transitive deps — listed here so they are managed by uv/pip,
+    # but `chatterbox-tts` itself is installed separately with --no-deps because
+    # it hard-pins torch==2.6.0, which would clobber the sm_120 (Blackwell)
+    # cu128 wheels required for RTX 50-series. See requirements-tts.txt.
+    "transformers>=4.46.0",
+    "diffusers>=0.29.0",
+    "librosa>=0.10.0",
+    "s3tokenizer>=0.1.7",
+    "conformer>=0.3.2",
+    "omegaconf>=2.3.0",
+    "pyloudnorm>=0.1.1",
+    "resemble-perth>=1.0.1",
+    "peft>=0.13.0",
+    "safetensors>=0.4.5",
+    "accelerate>=1.1.0",
 ]

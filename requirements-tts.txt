@@ -1,0 +1,15 @@
+# Chatterbox TTS — install with --no-deps to avoid the torch==2.6.0 pin.
+#
+# Required on RTX 50-series / Blackwell (compute capability sm_120): the
+# default chatterbox-tts wheel would downgrade torch to 2.6.0, which has no
+# sm_120 kernels and would fail at runtime with
+#   "no kernel image is available for execution on the device".
+#
+# Use:
+#   uv pip install --no-deps -r requirements-tts.txt
+# or:
+#   pip install --no-deps -r requirements-tts.txt
+#
+# The transitive deps are tracked in pyproject.toml / requirements.txt and
+# resolved normally so this single line is all that's needed here.
+chatterbox-tts

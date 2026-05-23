@@ -5,10 +5,12 @@ Iris STT Server - Speech-to-Text HTTP API
 Endpoints:
   GET    /health               - Health check
   POST   /transcribe           - Upload audio file, get text back
+  POST   /synthesize           - Send text, get WAV audio back (optional voice clone)
   POST   /detect-wake-word     - Stream raw float32 PCM chunk, get confidence score
   DELETE /wake-word/session    - Explicit session teardown on disarm
 """
 
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -26,10 +28,11 @@ if env_file.exists():
 import numpy as np
 import soundfile as sf
 import resampy
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 from stt import SpeechToText, SAMPLE_RATE
+from tts import TextToSpeech
 from wake_word import detect as ww_detect, remove_session as ww_remove_session
 
 app = Flask(__name__)
@@ -38,7 +41,9 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 
 # State
 stt_model = None
-is_ready = False
+tts_model = None
+stt_ready = False
+tts_ready = False
 
 # Auth - required
 API_KEY = os.environ.get("IRIS_STT_API_KEY")
@@ -61,16 +66,19 @@ def require_api_key(f):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "ready": is_ready,
-        "model": "nvidia/canary-180m-flash"
+        "ready": stt_ready and tts_ready,
+        "stt_ready": stt_ready,
+        "tts_ready": tts_ready,
+        "stt_model": "nvidia/canary-180m-flash",
+        "tts_model": "ResembleAI/chatterbox",
     })
 
 
 @app.route('/transcribe', methods=['POST'])
 @require_api_key
 def transcribe():
-    if not is_ready:
-        return jsonify({"error": "Model not ready yet"}), 503
+    if not stt_ready:
+        return jsonify({"error": "STT model not ready yet"}), 503
 
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided. Send as multipart with field name 'audio'"}), 400
@@ -109,6 +117,60 @@ def transcribe():
         os.unlink(temp_path)
 
 
+@app.route('/synthesize', methods=['POST'])
+@require_api_key
+def synthesize():
+    if not tts_ready:
+        return jsonify({"error": "TTS model not ready yet"}), 503
+
+    # Accept JSON or multipart (multipart needed when uploading a voice reference).
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text", "")
+        exaggeration = float(payload.get("exaggeration", 0.5))
+        cfg_weight = float(payload.get("cfg_weight", 0.5))
+    else:
+        text = request.form.get("text", "") or request.values.get("text", "")
+        exaggeration = float(request.form.get("exaggeration", 0.5))
+        cfg_weight = float(request.form.get("cfg_weight", 0.5))
+
+    if not text or not text.strip():
+        return jsonify({"error": "Missing 'text'"}), 400
+    if len(text) > 5000:
+        return jsonify({"error": "text too long (max 5000 chars)"}), 400
+    if not (0.0 <= exaggeration <= 2.0):
+        return jsonify({"error": "exaggeration must be between 0.0 and 2.0"}), 400
+    if not (0.0 <= cfg_weight <= 1.0):
+        return jsonify({"error": "cfg_weight must be between 0.0 and 1.0"}), 400
+
+    # Optional zero-shot voice cloning: 3–10 s of clean reference audio.
+    voice_path = None
+    if 'voice' in request.files:
+        voice_file = request.files['voice']
+        suffix = os.path.splitext(voice_file.filename or '.wav')[1] or '.wav'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            voice_file.save(f.name)
+            voice_path = f.name
+
+    try:
+        audio = tts_model.synthesize(
+            text,
+            audio_prompt_path=voice_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+        )
+        if audio.size == 0:
+            return jsonify({"error": "Synthesis produced no audio"}), 500
+
+        buf = io.BytesIO()
+        sf.write(buf, audio, tts_model.sample_rate, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        return send_file(buf, mimetype="audio/wav", as_attachment=False, download_name="speech.wav")
+    finally:
+        if voice_path:
+            os.unlink(voice_path)
+
+
 @app.route('/detect-wake-word', methods=['POST'])
 @require_api_key
 def detect_wake_word():
@@ -138,10 +200,16 @@ def delete_wake_session():
     return jsonify({"ok": True})
 
 
-def load_model():
-    global stt_model, is_ready
+def load_stt():
+    global stt_model, stt_ready
     stt_model = SpeechToText()
-    is_ready = True
+    stt_ready = True
+
+
+def load_tts():
+    global tts_model, tts_ready
+    tts_model = TextToSpeech()
+    tts_ready = True
 
 
 if __name__ == '__main__':
@@ -151,7 +219,8 @@ if __name__ == '__main__':
         exit(1)
 
     port = int(os.environ.get('PORT', 4260))
-    print(f"Loading model in background...")
-    threading.Thread(target=load_model, daemon=True).start()
+    print(f"Loading STT + TTS models in background...")
+    threading.Thread(target=load_stt, daemon=True).start()
+    threading.Thread(target=load_tts, daemon=True).start()
     print(f"Starting server on port {port} (API key required)...")
     app.run(host='0.0.0.0', port=port, threaded=True)
