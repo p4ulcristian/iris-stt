@@ -32,7 +32,7 @@ import resampy
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
-from stt import SpeechToText, SAMPLE_RATE
+from stt import SpeechToText, SAMPLE_RATE, MODEL_NAME as STT_MODEL_NAME
 from tts_orpheus import OrpheusTTS
 from normalize import normalize_for_tts
 
@@ -70,7 +70,7 @@ def health():
         "ready": stt_ready and tts_ready,
         "stt_ready": stt_ready,
         "tts_ready": tts_ready,
-        "stt_model": "nvidia/canary-1b",
+        "stt_model": STT_MODEL_NAME,
         "tts_model": "orpheus-3b (Q8_0)",
     })
 
