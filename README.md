@@ -2,7 +2,7 @@
 
 HTTP API for speech-to-text and text-to-speech.
 
-- **STT** — [nvidia/canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2): multilingual ASR over 25 European languages, run in-process via NeMo.
+- **STT** — [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3): multilingual ASR over 25 European languages with automatic language detection, run in-process via NeMo.
 - **TTS** — Orpheus (`orpheus-3b`, Q8_0), streamed as Server-Sent Events.
 
 Both models run on the local GPU (bfloat16 when CUDA is available, otherwise CPU). There is no external STT/TTS service.
@@ -54,7 +54,7 @@ curl https://iris-comms.irisdoes.work/health
   "ready": true,
   "stt_ready": true,
   "tts_ready": true,
-  "stt_model": "nvidia/canary-1b-v2",
+  "stt_model": "nvidia/parakeet-tdt-0.6b-v3",
   "tts_model": "orpheus-3b (Q8_0)"
 }
 ```
@@ -65,11 +65,11 @@ Upload an audio file, get transcribed text back. Requires `X-API-Key` header.
 
 **Parameters:**
 - `audio` (file, required) — audio file (wav, mp3, flac, ogg, etc.)
-- `language` (form field, optional) — source-language code (`"en"`, `"hu"`, …).
-  Canary requires a source language and does **not** auto-detect; omitted or
-  unsupported values fall back to `STT_DEFAULT_LANG` (default `"en"`). Supported:
-  bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro,
-  sk, sl, es, sv, ru, uk.
+- `language` (form field, optional) — **ignored**; parakeet-v3 auto-detects the
+  language. Detected code is returned in the `language` field of the response
+  (`"auto"` if the model does not expose it). Supported languages: bg, hr, cs,
+  da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es,
+  sv, ru, uk.
 
 ```bash
 curl -X POST \
@@ -129,12 +129,11 @@ curl -N -X POST \
 |---|---|---|---|
 | `IRIS_COMMS_API_KEY` | yes | — | API key for authentication |
 | `PORT` | no | `4260` | Server port |
-| `STT_DEFAULT_LANG` | no | `en` | Fallback source language for STT |
 | `CUDA_VISIBLE_DEVICES` | no | `0` | GPU device index |
 
 ## Models
 
-- **STT** — [nvidia/canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2) via NeMo, in-process. 25 European languages, GPU (bfloat16) when CUDA is available.
+- **STT** — [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) via NeMo, in-process. 25 European languages with automatic language detection, GPU (bfloat16) when CUDA is available.
 - **TTS** — Orpheus (`orpheus-3b`, Q8_0), in-process, streamed over SSE.
 
 Max upload size: 50MB.

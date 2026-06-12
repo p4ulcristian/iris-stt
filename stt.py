@@ -1,9 +1,9 @@
-"""Speech-to-Text via NVIDIA Canary-1B-v2 (NeMo, in-process).
+"""Speech-to-Text via NVIDIA Parakeet-TDT-0.6B-v3 (NeMo, in-process).
 
-Multilingual ASR over 25 European languages. The model runs directly on the
-GPU in this process — there is no external STT service. Canary requires the
-source language to be specified (it does not auto-detect); an omitted or
-unsupported hint falls back to STT_DEFAULT_LANG (default "en").
+Multilingual ASR over 25 European languages with **automatic language
+detection** — the source language does not need to be specified, so mixed
+Hungarian/English dictation just works. The model runs directly on the GPU in
+this process; there is no external STT service.
 """
 
 import os
@@ -23,18 +23,20 @@ import tempfile
 import soundfile as sf
 
 SAMPLE_RATE = 16000
-MODEL_NAME = "nvidia/canary-1b-v2"
-DEFAULT_LANG = os.environ.get("STT_DEFAULT_LANG", "en")
+MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 
-# canary-1b-v2 source languages (ISO 639-1).
-SUPPORTED_LANGS = {
-    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu",
-    "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
-}
+
+def _detected_lang(hyp):
+    """Best-effort read of the auto-detected language off a NeMo hypothesis."""
+    for attr in ("lang", "language", "langs"):
+        val = getattr(hyp, attr, None)
+        if val:
+            return val[0] if isinstance(val, (list, tuple)) else val
+    return "auto"
 
 
 class SpeechToText:
-    """NVIDIA Canary-1B-v2 multilingual speech recognition (in-process)."""
+    """NVIDIA Parakeet-TDT-0.6B-v3 multilingual ASR (in-process, auto-detect)."""
 
     model_name = MODEL_NAME
 
@@ -49,30 +51,23 @@ class SpeechToText:
         self.torch = torch
         self.model = ASRModel.from_pretrained(model_name=MODEL_NAME)
         self.model = self.model.to(self.device)
-        if self.device == "cuda":
-            self.model = self.model.to(torch.bfloat16)
+        # NB: keep float32. Parakeet's TDT decoder (CUDA-graph label looping)
+        # mixes float32 tensors internally, so a manual bfloat16 cast or
+        # autocast triggers "mat1 and mat2 must have the same dtype". The 0.6B
+        # model is small enough that float32 inference is still well sub-realtime.
         self.model.eval()
 
         print(f"STT model ready ({MODEL_NAME}) on {self.device}", flush=True)
-
-    def _resolve_lang(self, language):
-        """Map a requested language hint to a supported source code."""
-        if language:
-            code = language.split("-")[0].split("_")[0].lower()
-            if code in SUPPORTED_LANGS:
-                return code
-        return DEFAULT_LANG
 
     def transcribe(self, audio: np.ndarray, language: str = None) -> tuple[str, str]:
         """Transcribe audio to text.
 
         Args:
             audio: numpy array of audio samples at 16kHz
-            language: source-language hint (e.g. "en", "hu"); falls back to
-                STT_DEFAULT_LANG when omitted or unsupported
+            language: ignored — parakeet-v3 auto-detects the language
 
         Returns:
-            Tuple of (transcribed text, language code used)
+            Tuple of (transcribed text, detected language code or "auto")
         """
         if audio is None or len(audio) == 0:
             return "", ""
@@ -83,22 +78,16 @@ class SpeechToText:
         if np.abs(audio).max() > 1.0:
             audio = audio / np.abs(audio).max()
 
-        lang = self._resolve_lang(language)
-
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             sf.write(f.name, audio, SAMPLE_RATE)
             temp_path = f.name
 
         try:
-            with self.torch.autocast(
-                device_type=self.device,
-                dtype=self.torch.bfloat16,
-                enabled=self.device == "cuda",
-            ):
-                output = self.model.transcribe(
-                    [temp_path], source_lang=lang, target_lang=lang
-                )
-            text = output[0].text if output else ""
-            return (text.strip() if text else ""), lang
+            output = self.model.transcribe([temp_path])
+            if not output:
+                return "", "auto"
+            hyp = output[0]
+            text = (hyp.text or "").strip()
+            return text, _detected_lang(hyp)
         finally:
             os.unlink(temp_path)
