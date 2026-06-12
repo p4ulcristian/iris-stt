@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Iris STT Server - Speech-to-Text HTTP API
+Iris Comms Server — Speech-to-Text + Text-to-Speech HTTP API.
 
 Endpoints:
-  GET    /health               - Health check
-  POST   /transcribe           - Upload audio file, get text back
-  POST   /synthesize           - Send text, get WAV audio back (optional voice clone)
-  POST   /detect-wake-word     - Stream raw float32 PCM chunk, get confidence score
-  DELETE /wake-word/session    - Explicit session teardown on disarm
+  GET    /health             - Health check
+  POST   /stt/transcribe     - Upload audio file, get text back
+  POST   /tts/stream         - Stream TTS as Server-Sent Events
 """
 
+import base64
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
 import threading
+import subprocess
 
 # Load .env file
 env_file = Path(__file__).parent / ".env"
@@ -28,12 +29,12 @@ if env_file.exists():
 import numpy as np
 import soundfile as sf
 import resampy
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 from stt import SpeechToText, SAMPLE_RATE
-from tts import TextToSpeech
-from wake_word import detect as ww_detect, remove_session as ww_remove_session
+from tts_orpheus import OrpheusTTS
+from normalize import normalize_for_tts
 
 app = Flask(__name__)
 CORS(app)
@@ -45,8 +46,8 @@ tts_model = None
 stt_ready = False
 tts_ready = False
 
-# Auth - required
-API_KEY = os.environ.get("IRIS_STT_API_KEY")
+# Auth — required.
+API_KEY = os.environ.get("IRIS_COMMS_API_KEY")
 
 
 def require_api_key(f):
@@ -69,12 +70,29 @@ def health():
         "ready": stt_ready and tts_ready,
         "stt_ready": stt_ready,
         "tts_ready": tts_ready,
-        "stt_model": "nvidia/canary-180m-flash",
-        "tts_model": "ResembleAI/chatterbox",
+        "stt_model": "nvidia/canary-1b",
+        "tts_model": "orpheus-3b (Q8_0)",
     })
 
 
-@app.route('/transcribe', methods=['POST'])
+def convert_to_wav(input_path):
+    """Convert any audio format to WAV using ffmpeg."""
+    output_path = input_path.rsplit(".", 1)[0] + "_converted.wav"
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", "-f", "wav", output_path
+        ], capture_output=True, timeout=30)
+        if result.returncode == 0:
+            return output_path
+        print(f"ffmpeg conversion failed: {result.stderr.decode()[:200]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"ffmpeg error: {e}", flush=True)
+        return None
+
+
+@app.route('/stt/transcribe', methods=['POST'])
 @require_api_key
 def transcribe():
     if not stt_ready:
@@ -93,7 +111,16 @@ def transcribe():
         temp_path = f.name
 
     try:
-        audio, sr = sf.read(temp_path)
+        # Try to read directly, convert if needed
+        converted_path = None
+        try:
+            audio, sr = sf.read(temp_path)
+        except Exception as read_err:
+            print(f"Direct read failed ({read_err}), converting with ffmpeg...", flush=True)
+            converted_path = convert_to_wav(temp_path)
+            if not converted_path:
+                return jsonify({"error": "Audio format not supported"}), 400
+            audio, sr = sf.read(converted_path)
 
         # Convert stereo to mono
         if audio.ndim > 1:
@@ -115,89 +142,69 @@ def transcribe():
         })
     finally:
         os.unlink(temp_path)
+        if converted_path and os.path.exists(converted_path):
+            os.unlink(converted_path)
 
 
-@app.route('/synthesize', methods=['POST'])
+@app.route('/tts/stream', methods=['POST'])
 @require_api_key
-def synthesize():
+def tts_stream():
+    """Stream synthesized speech as Server-Sent Events.
+
+    Emits:
+      event: chunk
+      data: {"seq": <int>, "text": "...", "sample_rate": 24000, "audio_b64": "<base64 WAV>"}
+      ...
+      event: done
+      data: {"chunks": <int>}
+      ...
+      event: error
+      data: {"error": "..."}
+    """
     if not tts_ready:
         return jsonify({"error": "TTS model not ready yet"}), 503
 
-    # Accept JSON or multipart (multipart needed when uploading a voice reference).
     if request.is_json:
         payload = request.get_json(silent=True) or {}
         text = payload.get("text", "")
-        exaggeration = float(payload.get("exaggeration", 0.5))
-        cfg_weight = float(payload.get("cfg_weight", 0.5))
     else:
         text = request.form.get("text", "") or request.values.get("text", "")
-        exaggeration = float(request.form.get("exaggeration", 0.5))
-        cfg_weight = float(request.form.get("cfg_weight", 0.5))
 
     if not text or not text.strip():
         return jsonify({"error": "Missing 'text'"}), 400
     if len(text) > 5000:
         return jsonify({"error": "text too long (max 5000 chars)"}), 400
-    if not (0.0 <= exaggeration <= 2.0):
-        return jsonify({"error": "exaggeration must be between 0.0 and 2.0"}), 400
-    if not (0.0 <= cfg_weight <= 1.0):
-        return jsonify({"error": "cfg_weight must be between 0.0 and 1.0"}), 400
 
-    # Optional zero-shot voice cloning: 3–10 s of clean reference audio.
-    voice_path = None
-    if 'voice' in request.files:
-        voice_file = request.files['voice']
-        suffix = os.path.splitext(voice_file.filename or '.wav')[1] or '.wav'
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-            voice_file.save(f.name)
-            voice_path = f.name
+    clean_text = normalize_for_tts(text)
 
-    try:
-        audio = tts_model.synthesize(
-            text,
-            audio_prompt_path=voice_path,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
-        )
-        if audio.size == 0:
-            return jsonify({"error": "Synthesis produced no audio"}), 500
+    sr = tts_model.sample_rate
 
-        buf = io.BytesIO()
-        sf.write(buf, audio, tts_model.sample_rate, format="WAV", subtype="PCM_16")
-        buf.seek(0)
-        return send_file(buf, mimetype="audio/wav", as_attachment=False, download_name="speech.wav")
-    finally:
-        if voice_path:
-            os.unlink(voice_path)
+    def gen():
+        try:
+            chunk_seq = 0
+            first_chunk = True
+            for audio_chunk in tts_model.synthesize_stream(clean_text):
+                if audio_chunk is None or len(audio_chunk) == 0:
+                    continue
+                buf = io.BytesIO()
+                sf.write(buf, audio_chunk, sr, format="WAV", subtype="PCM_16")
+                payload = {
+                    "seq": chunk_seq,
+                    "sample_rate": sr,
+                    "audio_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                }
+                if first_chunk:
+                    payload["text"] = text
+                    first_chunk = False
+                yield f"event: chunk\ndata: {json.dumps(payload)}\n\n"
+                chunk_seq += 1
+            yield f"event: done\ndata: {json.dumps({'chunks': chunk_seq})}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
-
-@app.route('/detect-wake-word', methods=['POST'])
-@require_api_key
-def detect_wake_word():
-    session_id = request.headers.get("X-Wake-Session")
-    if not session_id:
-        return jsonify({"error": "X-Wake-Session header required"}), 400
-
-    audio_bytes = request.get_data()
-
-    min_bytes = 1280 * 4  # 1280 float32 samples = 80 ms
-    if len(audio_bytes) < min_bytes:
-        return jsonify({"error": f"Audio too short (got {len(audio_bytes)} bytes, need >= {min_bytes})"}), 400
-
-    if len(audio_bytes) % 4 != 0:
-        return jsonify({"error": "Body must be raw float32 PCM (byte length must be a multiple of 4)"}), 400
-
-    result = ww_detect(session_id, audio_bytes)
-    return jsonify(result)
-
-
-@app.route('/wake-word/session', methods=['DELETE'])
-@require_api_key
-def delete_wake_session():
-    session_id = request.headers.get("X-Wake-Session")
-    if session_id:
-        ww_remove_session(session_id)
-    return jsonify({"ok": True})
+    return Response(stream_with_context(gen()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def load_stt():
@@ -208,19 +215,23 @@ def load_stt():
 
 def load_tts():
     global tts_model, tts_ready
-    tts_model = TextToSpeech()
+    tts_model = OrpheusTTS()
     tts_ready = True
 
 
 if __name__ == '__main__':
     if not API_KEY:
-        print("ERROR: Set IRIS_STT_API_KEY environment variable before starting.")
-        print("  export IRIS_STT_API_KEY=your-secret-key")
+        print("ERROR: Set IRIS_COMMS_API_KEY environment variable before starting.")
+        print("  export IRIS_COMMS_API_KEY=your-secret-key")
         exit(1)
 
     port = int(os.environ.get('PORT', 4260))
-    print(f"Loading STT + TTS models in background...")
-    threading.Thread(target=load_stt, daemon=True).start()
-    threading.Thread(target=load_tts, daemon=True).start()
+
+    def warmup():
+        load_stt()
+        load_tts()
+
+    print(f"Loading STT then TTS models in background...")
+    threading.Thread(target=warmup, daemon=True).start()
     print(f"Starting server on port {port} (API key required)...")
     app.run(host='0.0.0.0', port=port, threaded=True)

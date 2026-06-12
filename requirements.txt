@@ -7,6 +7,7 @@ torch
 nemo_toolkit[asr]
 # Chatterbox TTS transitive deps (chatterbox-tts itself installed separately,
 # see requirements-tts.txt — it pins torch==2.6.0 which breaks sm_120/Blackwell)
+
 transformers>=4.46.0
 diffusers>=0.29.0
 librosa>=0.10.0

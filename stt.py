@@ -1,52 +1,39 @@
-"""NVIDIA Canary 1B Flash STT - English speech recognition."""
+"""Speech-to-Text via NVIDIA Canary 1B NIM API."""
 
 import os
-import logging
-
-# Must set before any torch imports
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-
-# Suppress warnings
-logging.disable(logging.WARNING)
-
-import warnings
-warnings.filterwarnings('ignore')
-
-import numpy as np
+import io
 import tempfile
+import numpy as np
 import soundfile as sf
+import requests
 
 SAMPLE_RATE = 16000
-MODEL_NAME = "nvidia/canary-180m-flash"
+STT_API_URL = os.environ.get("STT_API_URL", "http://localhost:8000")
 
 
 class SpeechToText:
-    """NVIDIA Canary 1B Flash for English speech recognition."""
+    """STT via NVIDIA Canary 1B NIM API."""
 
     def __init__(self):
-        print(f"Loading STT model ({MODEL_NAME})...", flush=True)
-
-        import torch
-        torch.set_float32_matmul_precision("high")
-        from nemo.collections.asr.models import ASRModel
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.torch = torch
-        self.model = ASRModel.from_pretrained(model_name=MODEL_NAME)
-        self.model = self.model.to(self.device)
-        if self.device == "cuda":
-            self.model = self.model.to(self.torch.bfloat16)
-        self.model.eval()
-
-        print(f"STT model ready ({MODEL_NAME}) on {self.device}", flush=True)
+        print(f"Connecting to STT Docker API at {STT_API_URL}...", flush=True)
+        self.api_url = STT_API_URL
+        
+        # Check connection
+        try:
+            resp = requests.get(f"{self.api_url}/health", timeout=5)
+            if resp.status_code == 200:
+                print(f"STT Docker API ready", flush=True)
+            else:
+                print(f"STT API returned {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"Warning: STT API not reachable: {e}", flush=True)
 
     def transcribe(self, audio: np.ndarray, language: str = None) -> tuple[str, str]:
-        """Transcribe audio to text (English only).
+        """Transcribe audio to text.
 
         Args:
             audio: numpy array of audio samples at 16kHz
-            language: ignored, always transcribes as English
+            language: language hint (optional)
 
         Returns:
             Tuple of (transcribed text, language code)
@@ -60,16 +47,34 @@ class SpeechToText:
         if np.abs(audio).max() > 1.0:
             audio = audio / np.abs(audio).max()
 
+        # Save to temp WAV file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             sf.write(f.name, audio, SAMPLE_RATE)
             temp_path = f.name
 
         try:
-            with self.torch.autocast(device_type=self.device, dtype=self.torch.bfloat16, enabled=self.device == "cuda"):
-                output = self.model.transcribe(
-                    [temp_path], source_lang="en", target_lang="en"
+            # Call Docker STT API (faster-whisper uses ISO 639-1 two-letter codes, e.g. "en")
+            with open(temp_path, "rb") as audio_file:
+                lang_code = language or "en"
+                # Strip BCP-47 region suffix if present (e.g. "en-US" → "en")
+                lang_code = lang_code.split("-")[0].split("_")[0]
+                resp = requests.post(
+                    f"{self.api_url}/v1/audio/transcriptions",
+                    files={"file": ("audio.wav", audio_file, "audio/wav")},
+                    data={"language": lang_code},
+                    timeout=60
                 )
-            text = output[0].text if output else ""
-            return text.strip() if text else "", "en"
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                text = result.get("text", "")
+                return text.strip(), language or "en"
+            else:
+                print(f"STT API error: {resp.status_code} - {resp.text[:200]}", flush=True)
+                return "", ""
+                
+        except Exception as e:
+            print(f"STT error: {e}", flush=True)
+            return "", ""
         finally:
             os.unlink(temp_path)

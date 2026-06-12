@@ -1,10 +1,9 @@
-# Iris STT + TTS
+# Iris Comms
 
 HTTP API for speech-to-text and text-to-speech.
 
 - **STT** — NVIDIA Canary 180m-flash (English).
 - **TTS** — Resemble AI's Chatterbox, with optional zero-shot voice cloning.
-- **Wake word** — openWakeWord, per-session state for `hey iris`.
 
 ## Setup
 
@@ -34,22 +33,22 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 ## Usage
 
 ```bash
-export IRIS_STT_API_KEY=your-secret-key
+export IRIS_COMMS_API_KEY=your-secret-key
 python server.py
 ```
 
 Server starts on port `4260` (override with `PORT` env var).
 
-Public URL: `https://iris-stt.irisdoes.work`
+Public URL: `https://iris-comms.irisdoes.work`
 
 ## API
 
 ### `GET /health`
 
-Check if the model is loaded. No auth required.
+Check if the models are loaded. No auth required.
 
 ```bash
-curl https://iris-stt.irisdoes.work/health
+curl https://iris-comms.irisdoes.work/health
 ```
 
 ```json
@@ -62,7 +61,7 @@ curl https://iris-stt.irisdoes.work/health
 }
 ```
 
-### `POST /transcribe`
+### `POST /stt/transcribe`
 
 Upload an audio file, get transcribed text back. Requires `X-API-Key` header.
 
@@ -74,7 +73,7 @@ Upload an audio file, get transcribed text back. Requires `X-API-Key` header.
 curl -X POST \
   -H "X-API-Key: your-secret-key" \
   -F "audio=@recording.wav" \
-  https://iris-stt.irisdoes.work/transcribe
+  https://iris-comms.irisdoes.work/stt/transcribe
 ```
 
 ```json
@@ -88,10 +87,10 @@ curl -X POST \
   -H "X-API-Key: your-secret-key" \
   -F "audio=@recording.wav" \
   -F "language=hu" \
-  https://iris-stt.irisdoes.work/transcribe
+  https://iris-comms.irisdoes.work/stt/transcribe
 ```
 
-### `POST /synthesize`
+### `POST /tts/synthesize`
 
 Send text, get a WAV (24 kHz mono PCM16). Requires `X-API-Key`.
 
@@ -106,7 +105,7 @@ curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello from Iris."}' \
   --output speech.wav \
-  https://iris-stt.irisdoes.work/synthesize
+  https://iris-comms.irisdoes.work/tts/synthesize
 ```
 
 **Zero-shot voice cloning** — upload a 3–10 s clean reference clip as multipart `voice`:
@@ -117,14 +116,14 @@ curl -X POST \
   -F "text=Hello from Iris." \
   -F "voice=@reference.wav" \
   --output speech.wav \
-  https://iris-stt.irisdoes.work/synthesize
+  https://iris-comms.irisdoes.work/tts/synthesize
 ```
 
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `IRIS_STT_API_KEY` | yes | — | API key for authentication |
+| `IRIS_COMMS_API_KEY` | yes | — | API key for authentication |
 | `PORT` | no | `4260` | Server port |
 | `CUDA_VISIBLE_DEVICES` | no | `0` | GPU device index |
 
