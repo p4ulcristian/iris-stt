@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Iris STT Server - Speech-to-Text HTTP API
+Iris Comms Server — Speech-to-Text + Text-to-Speech HTTP API.
 
 Endpoints:
-  GET    /health               - Health check
-  POST   /transcribe           - Upload audio file, get text back
-  POST   /detect-wake-word     - Stream raw float32 PCM chunk, get confidence score
-  DELETE /wake-word/session    - Explicit session teardown on disarm
+  GET    /health             - Health check
+  POST   /stt/transcribe     - Upload audio file, get text back
+  POST   /tts/stream         - Stream TTS as Server-Sent Events
 """
 
+import base64
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
 import threading
+import subprocess
 
 # Load .env file
 env_file = Path(__file__).parent / ".env"
@@ -26,11 +29,12 @@ if env_file.exists():
 import numpy as np
 import soundfile as sf
 import resampy
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
-from stt import SpeechToText, SAMPLE_RATE
-from wake_word import detect as ww_detect, remove_session as ww_remove_session
+from stt import SpeechToText, SAMPLE_RATE, MODEL_NAME as STT_MODEL_NAME
+from tts_chatterbox import ChatterboxTTS, MODEL_NAME as TTS_MODEL_NAME
+from normalize import normalize_for_tts
 
 app = Flask(__name__)
 CORS(app)
@@ -38,10 +42,12 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 
 # State
 stt_model = None
-is_ready = False
+tts_model = None
+stt_ready = False
+tts_ready = False
 
-# Auth - required
-API_KEY = os.environ.get("IRIS_STT_API_KEY")
+# Auth — required.
+API_KEY = os.environ.get("IRIS_COMMS_API_KEY")
 
 
 def require_api_key(f):
@@ -61,16 +67,36 @@ def require_api_key(f):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "ready": is_ready,
-        "model": "nvidia/canary-180m-flash"
+        "ready": stt_ready and tts_ready,
+        "stt_ready": stt_ready,
+        "tts_ready": tts_ready,
+        "stt_model": STT_MODEL_NAME,
+        "tts_model": TTS_MODEL_NAME,
     })
 
 
-@app.route('/transcribe', methods=['POST'])
+def convert_to_wav(input_path):
+    """Convert any audio format to WAV using ffmpeg."""
+    output_path = input_path.rsplit(".", 1)[0] + "_converted.wav"
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", "-f", "wav", output_path
+        ], capture_output=True, timeout=30)
+        if result.returncode == 0:
+            return output_path
+        print(f"ffmpeg conversion failed: {result.stderr.decode()[:200]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"ffmpeg error: {e}", flush=True)
+        return None
+
+
+@app.route('/stt/transcribe', methods=['POST'])
 @require_api_key
 def transcribe():
-    if not is_ready:
-        return jsonify({"error": "Model not ready yet"}), 503
+    if not stt_ready:
+        return jsonify({"error": "STT model not ready yet"}), 503
 
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided. Send as multipart with field name 'audio'"}), 400
@@ -85,7 +111,16 @@ def transcribe():
         temp_path = f.name
 
     try:
-        audio, sr = sf.read(temp_path)
+        # Try to read directly, convert if needed
+        converted_path = None
+        try:
+            audio, sr = sf.read(temp_path)
+        except Exception as read_err:
+            print(f"Direct read failed ({read_err}), converting with ffmpeg...", flush=True)
+            converted_path = convert_to_wav(temp_path)
+            if not converted_path:
+                return jsonify({"error": "Audio format not supported"}), 400
+            audio, sr = sf.read(converted_path)
 
         # Convert stereo to mono
         if audio.ndim > 1:
@@ -107,51 +142,103 @@ def transcribe():
         })
     finally:
         os.unlink(temp_path)
+        if converted_path and os.path.exists(converted_path):
+            os.unlink(converted_path)
 
 
-@app.route('/detect-wake-word', methods=['POST'])
+@app.route('/tts/stream', methods=['POST'])
 @require_api_key
-def detect_wake_word():
-    session_id = request.headers.get("X-Wake-Session")
-    if not session_id:
-        return jsonify({"error": "X-Wake-Session header required"}), 400
+def tts_stream():
+    """Stream synthesized speech as Server-Sent Events.
 
-    audio_bytes = request.get_data()
+    Emits:
+      event: chunk
+      data: {"seq": <int>, "text": "...", "sample_rate": 24000, "audio_b64": "<base64 WAV>"}
+      ...
+      event: done
+      data: {"chunks": <int>}
+      ...
+      event: error
+      data: {"error": "..."}
+    """
+    if not tts_ready:
+        return jsonify({"error": "TTS model not ready yet"}), 503
 
-    min_bytes = 1280 * 4  # 1280 float32 samples = 80 ms
-    if len(audio_bytes) < min_bytes:
-        return jsonify({"error": f"Audio too short (got {len(audio_bytes)} bytes, need >= {min_bytes})"}), 400
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text", "")
+    else:
+        text = request.form.get("text", "") or request.values.get("text", "")
 
-    if len(audio_bytes) % 4 != 0:
-        return jsonify({"error": "Body must be raw float32 PCM (byte length must be a multiple of 4)"}), 400
+    if not text or not text.strip():
+        return jsonify({"error": "Missing 'text'"}), 400
+    if len(text) > 5000:
+        return jsonify({"error": "text too long (max 5000 chars)"}), 400
 
-    result = ww_detect(session_id, audio_bytes)
-    return jsonify(result)
+    clean_text = normalize_for_tts(text)
+
+    sr = tts_model.sample_rate
+
+    def gen():
+        try:
+            chunk_seq = 0
+            first_chunk = True
+            for audio_chunk in tts_model.synthesize_stream(clean_text):
+                if audio_chunk is None or len(audio_chunk) == 0:
+                    continue
+                buf = io.BytesIO()
+                sf.write(buf, audio_chunk, sr, format="WAV", subtype="PCM_16")
+                payload = {
+                    "seq": chunk_seq,
+                    "sample_rate": sr,
+                    "audio_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                }
+                if first_chunk:
+                    payload["text"] = text
+                    first_chunk = False
+                yield f"event: chunk\ndata: {json.dumps(payload)}\n\n"
+                chunk_seq += 1
+            yield f"event: done\ndata: {json.dumps({'chunks': chunk_seq})}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return Response(stream_with_context(gen()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.route('/wake-word/session', methods=['DELETE'])
-@require_api_key
-def delete_wake_session():
-    session_id = request.headers.get("X-Wake-Session")
-    if session_id:
-        ww_remove_session(session_id)
-    return jsonify({"ok": True})
-
-
-def load_model():
-    global stt_model, is_ready
+def load_stt():
+    global stt_model, stt_ready
     stt_model = SpeechToText()
-    is_ready = True
+    stt_ready = True
+
+
+def load_tts():
+    global tts_model, tts_ready
+    tts_model = ChatterboxTTS()
+    tts_ready = True
 
 
 if __name__ == '__main__':
     if not API_KEY:
-        print("ERROR: Set IRIS_STT_API_KEY environment variable before starting.")
-        print("  export IRIS_STT_API_KEY=your-secret-key")
+        print("ERROR: Set IRIS_COMMS_API_KEY environment variable before starting.")
+        print("  export IRIS_COMMS_API_KEY=your-secret-key")
         exit(1)
 
     port = int(os.environ.get('PORT', 4260))
-    print(f"Loading model in background...")
-    threading.Thread(target=load_model, daemon=True).start()
+
+    def warmup():
+        for name, loader in (("STT", load_stt), ("TTS", load_tts)):
+            try:
+                loader()
+            except Exception:
+                import traceback
+                print(f"ERROR: {name} model failed to load; exiting so systemd restarts us", flush=True)
+                traceback.print_exc()
+                # sys.exit() from a thread would only end the thread.
+                os._exit(1)
+
+    print(f"Loading STT then TTS models in background...")
+    threading.Thread(target=warmup, daemon=True).start()
     print(f"Starting server on port {port} (API key required)...")
     app.run(host='0.0.0.0', port=port, threaded=True)

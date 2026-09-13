@@ -5,3 +5,17 @@ soundfile
 resampy
 torch
 nemo_toolkit[asr]
+# Chatterbox pins torch==2.6.0 / transformers==5.2.0, which break Blackwell
+# GPUs and NeMo. uv applies overrides from pyproject.toml; with plain pip,
+# install chatterbox-tts with --no-deps after the packages below.
+transformers>=4.46.0,<5
+diffusers>=0.29.0
+librosa>=0.10.0
+s3tokenizer
+conformer
+omegaconf
+pyloudnorm
+resemble-perth
+peft
+safetensors
+accelerate
