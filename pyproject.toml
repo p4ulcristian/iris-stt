@@ -12,10 +12,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "torch>=2.10.0",
     "nemo_toolkit[asr]",
-    # Chatterbox's transitive deps — listed here so they are managed by uv/pip,
-    # but `chatterbox-tts` itself is installed separately with --no-deps because
-    # it hard-pins torch==2.6.0, which would clobber the sm_120 (Blackwell)
-    # cu128 wheels required for RTX 50-series. See requirements-tts.txt.
+    "chatterbox-tts>=0.1.7",
     "transformers>=4.46.0",
     "diffusers>=0.29.0",
     "librosa>=0.10.0",
@@ -27,4 +24,25 @@ dependencies = [
     "peft>=0.13.0",
     "safetensors>=0.4.5",
     "accelerate>=1.1.0",
+]
+
+[tool.uv]
+# The Nix-built python in ~/.nix-profile links a private glibc that cannot load
+# the system NVIDIA driver (libcuda.so) -> "CUDA error: unknown error" at load.
+# Always use a uv-managed CPython, which links the system glibc.
+python-preference = "only-managed"
+# chatterbox-tts hard-pins torch==2.6.0, which has no sm_120 (RTX 50-series)
+# kernels, plus transformers==5.2.0 that NeMo cannot use. Override those pins
+# with the versions this project already runs, and drop its demo-only deps
+# (gradio UI, Japanese/Chinese text segmenters for the multilingual model).
+override-dependencies = [
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+    "transformers>=4.46.0,<5",
+    "diffusers>=0.29.0",
+    "safetensors>=0.4.5",
+    "numpy>=2",
+    "gradio; sys_platform == 'never'",
+    "pykakasi; sys_platform == 'never'",
+    "spacy-pkuseg; sys_platform == 'never'",
 ]

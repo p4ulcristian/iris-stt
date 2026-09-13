@@ -33,7 +33,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 from stt import SpeechToText, SAMPLE_RATE, MODEL_NAME as STT_MODEL_NAME
-from tts_orpheus import OrpheusTTS
+from tts_chatterbox import ChatterboxTTS, MODEL_NAME as TTS_MODEL_NAME
 from normalize import normalize_for_tts
 
 app = Flask(__name__)
@@ -71,7 +71,7 @@ def health():
         "stt_ready": stt_ready,
         "tts_ready": tts_ready,
         "stt_model": STT_MODEL_NAME,
-        "tts_model": "orpheus-3b (Q8_0)",
+        "tts_model": TTS_MODEL_NAME,
     })
 
 
@@ -215,7 +215,7 @@ def load_stt():
 
 def load_tts():
     global tts_model, tts_ready
-    tts_model = OrpheusTTS()
+    tts_model = ChatterboxTTS()
     tts_ready = True
 
 
@@ -228,8 +228,15 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 4260))
 
     def warmup():
-        load_stt()
-        load_tts()
+        for name, loader in (("STT", load_stt), ("TTS", load_tts)):
+            try:
+                loader()
+            except Exception:
+                import traceback
+                print(f"ERROR: {name} model failed to load; exiting so systemd restarts us", flush=True)
+                traceback.print_exc()
+                # sys.exit() from a thread would only end the thread.
+                os._exit(1)
 
     print(f"Loading STT then TTS models in background...")
     threading.Thread(target=warmup, daemon=True).start()

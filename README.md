@@ -3,9 +3,9 @@
 HTTP API for speech-to-text and text-to-speech.
 
 - **STT** — [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3): multilingual ASR over 25 European languages with automatic language detection, run in-process via NeMo.
-- **TTS** — Orpheus (`orpheus-3b`, Q8_0), streamed as Server-Sent Events.
+- **TTS** — [ResembleAI/chatterbox-turbo](https://huggingface.co/ResembleAI/chatterbox-turbo): 350M English model, cloned from `voices/iris-female-ref.wav`, streamed sentence by sentence as Server-Sent Events.
 
-Both models run on the local GPU (bfloat16 when CUDA is available, otherwise CPU). There is no external STT/TTS service.
+Both models run in-process on the local GPU (CPU fallback). There is no external STT/TTS service.
 
 ## Setup
 
@@ -14,6 +14,14 @@ Dependencies are managed with `uv` against a Python 3.11 venv:
 ```bash
 uv sync
 ```
+
+The venv must use a **uv-managed** CPython (pinned in `pyproject.toml`). A
+Nix-built python links its own glibc and cannot load the system NVIDIA driver,
+which shows up as `CUDA error: unknown error` while loading the STT model.
+
+`chatterbox-tts` hard-pins `torch==2.6.0` and `transformers==5.2.0`. The
+`override-dependencies` in `pyproject.toml` replace those pins, so `uv sync`
+installs it cleanly next to NeMo.
 
 ### Note for RTX 50-series / Blackwell (sm_120)
 
@@ -55,7 +63,7 @@ curl https://iris-comms.irisdoes.work/health
   "stt_ready": true,
   "tts_ready": true,
   "stt_model": "nvidia/parakeet-tdt-0.6b-v3",
-  "tts_model": "orpheus-3b (Q8_0)"
+  "tts_model": "ResembleAI/chatterbox-turbo"
 }
 ```
 
@@ -113,7 +121,10 @@ data: {"error": "..."}
 ```
 
 Each `chunk` carries a base64-encoded WAV (mono PCM16) fragment; `text` is
-included only on the first chunk. `sample_rate` is reported per chunk.
+included only on the first chunk. `sample_rate` is reported per chunk (24000).
+Each sentence is sent as its own chunk as soon as it is rendered, so playback
+starts in about half a second and stays ahead of realtime. English only.
+Output carries Resemble's inaudible Perth watermark.
 
 ```bash
 curl -N -X POST \
@@ -130,10 +141,11 @@ curl -N -X POST \
 | `IRIS_COMMS_API_KEY` | yes | — | API key for authentication |
 | `PORT` | no | `4260` | Server port |
 | `CUDA_VISIBLE_DEVICES` | no | `0` | GPU device index |
+| `IRIS_VOICE` | no | `voices/iris-female-ref.wav` | Reference clip (>5 s) for the cloned voice |
 
 ## Models
 
 - **STT** — [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) via NeMo, in-process. 25 European languages with automatic language detection, GPU (bfloat16) when CUDA is available.
-- **TTS** — Orpheus (`orpheus-3b`, Q8_0), in-process, streamed over SSE.
+- **TTS** — [ResembleAI/chatterbox-turbo](https://huggingface.co/ResembleAI/chatterbox-turbo), in-process, streamed over SSE.
 
 Max upload size: 50MB.
