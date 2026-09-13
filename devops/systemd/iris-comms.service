@@ -1,0 +1,30 @@
+[Unit]
+Description=Iris Comms (STT + TTS HTTP API)
+# sops, the WireGuard listener and the first Hugging Face cache check all want
+# a configured network, not just the network stack.
+Wants=network-online.target
+After=network-online.target
+# Give up after 5 failed starts in 10 minutes instead of looping forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=p4ulcristian
+WorkingDirectory=/home/p4ulcristian/Work/iris/iris-comms
+Environment=HOME=/home/p4ulcristian
+# uv lives in ~/.nix-profile/bin; the interpreter itself is uv-managed (system
+# glibc). Do not add Nix LD_LIBRARY_PATH / LD_PRELOAD shims: the Nix glibc
+# cannot load the system NVIDIA driver.
+Environment=PATH=/home/p4ulcristian/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/p4ulcristian/Work/iris/iris-comms/prod.sh
+# server.py exits non-zero if a model fails to load, so this also covers a
+# half-started service, not only crashes.
+Restart=on-failure
+RestartSec=10
+# Model teardown on the GPU can take a few seconds.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
